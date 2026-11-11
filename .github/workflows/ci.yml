@@ -1,0 +1,27 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: make CC=${{ matrix.cc }}
+
+      - name: Smoke test (--help)
+        run: ./c-reef --help
+
+      - name: Sanitizer run under a pty (SIGTERM must exit cleanly)
+        run: |
+          make debug CC=${{ matrix.cc }}
+          set +e
+          script -qec "timeout 5 ./c-reef-asan --sound" /dev/null
+          rc=$?
+          # 124 = timeout fired, which is the expected outcome
+          [ $rc -eq 124 ] || [ $rc -eq 0 ] || exit $rc

@@ -1,5 +1,7 @@
 c-reef
+c-reef-asan
 aquarium
 *.o
 *.out
 *.exe
+*.cast

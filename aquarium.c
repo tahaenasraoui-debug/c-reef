@@ -1,22 +1,25 @@
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200112L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <termios.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <math.h>
 
 /* =========================================================================
- * CONSTANTES & PALETTE ANSI
+ * CONSTANTS & ANSI PALETTE
  * ========================================================================= */
 #define MAX_ENTITIES 80
 #define MAX_BUBBLES  120
 #define MAX_KELP     16
 #define FPS          30
 #define FRAME_NS     (1000000000L / FPS)
+#define MIN_COLS     30
+#define MIN_ROWS     12
 
 enum ColorID {
     COL_RESET = 0,
@@ -61,7 +64,7 @@ static const char *ANSI_TABLE[] = {
 };
 
 /* =========================================================================
- * DÉFINITION EXACTE DES SPRITES (GÉOMÉTRIE ET SYMÉTRIE PRÉSERVÉES)
+ * SPRITE DEFINITIONS (GEOMETRY AND SYMMETRY PRESERVED)
  * ========================================================================= */
 static const char *SPR_MINNOW_R[] = { "><>" };
 static const char *SPR_MINNOW_L[] = { "<><" };
@@ -203,7 +206,7 @@ static const char *SPR_CRAB_B[] = {
 };
 
 /* =========================================================================
- * STRUCTURES DE DONNÉES
+ * DATA STRUCTURES
  * ========================================================================= */
 typedef enum {
     SPECIES_MINNOW = 0,
@@ -245,7 +248,7 @@ typedef struct {
 } Kelp;
 
 /* =========================================================================
- * ÉTAT GLOBAL & BUFFERS
+ * GLOBAL STATE & BUFFERS
  * ========================================================================= */
 static volatile sig_atomic_t g_running = 1;
 static volatile sig_atomic_t g_resized = 0;
@@ -268,9 +271,14 @@ static Kelp   g_kelps[MAX_KELP];
 static int    g_num_kelps = 0;
 static long   g_tick = 0;
 static pid_t  g_audio_pid = -1;
+static int    g_sound = 0;        /* --sound */
+static int    g_use_color = 1;    /* cleared by NO_COLOR */
+static int    g_buffers_ok = 0;   /* 0 while the terminal is too small */
+static int    g_raw_enabled = 0;
+static struct termios g_saved_termios;
 
 /* =========================================================================
- * UTILITAIRES & GESTION DES SIGNAUX POSIX
+ * UTILITIES & POSIX SIGNAL HANDLING
  * ========================================================================= */
 static void handle_sig(int sig) {
     (void)sig;
@@ -342,15 +350,17 @@ static void init_seabed(void) {
     }
 }
 
-static void allocate_buffers(void) {
+/* Returns 1 on success, 0 if the terminal is smaller than MIN_COLS x MIN_ROWS. */
+static int allocate_buffers(void) {
     struct winsize ws;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 20 && ws.ws_row > 10) {
-        g_width  = ws.ws_col;
-        g_height = ws.ws_row;
-    } else {
-        g_width  = 80;
-        g_height = 24;
+    int w = 80, h = 24; /* fallback if the size cannot be queried */
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) {
+        w = ws.ws_col;
+        h = ws.ws_row;
     }
+    if (w < MIN_COLS || h < MIN_ROWS) return 0;
+    g_width  = w;
+    g_height = h;
 
     g_char_buf = malloc(sizeof(char *) * g_height);
     g_col_buf  = malloc(sizeof(unsigned char *) * g_height);
@@ -368,10 +378,11 @@ static void allocate_buffers(void) {
     g_out_buf = malloc(g_out_buf_cap);
 
     init_seabed();
+    return 1;
 }
 
 /* =========================================================================
- * RENDU DES SPRITES AVEC TRANSPARENCE & CLIPPING STRICT
+ * SPRITE RENDERING WITH TRANSPARENCY & STRICT CLIPPING
  * ========================================================================= */
 #define DEGREE_TOKEN ((char)-1)
 
@@ -462,7 +473,7 @@ static void draw_entity(const Entity *e) {
 }
 
 /* =========================================================================
- * SPAWN & PHYSIQUE DES ENTITÉS
+ * ENTITY SPAWNING & PHYSICS
  * ========================================================================= */
 static int find_free_slot(void) {
     for (int i = 0; i < MAX_ENTITIES; i++) {
@@ -730,7 +741,7 @@ static void update_simulation(void) {
 }
 
 /* =========================================================================
- * PIPELINE DE RENDU DOUBLE-BUFFER EN MÉMOIRE (POSIX / LINUX)
+ * IN-MEMORY DOUBLE-BUFFER RENDER PIPELINE
  * ========================================================================= */
 static void render_frame(void) {
     for (int r = 0; r < g_height; r++) {
@@ -791,10 +802,12 @@ static void render_frame(void) {
             char ch = g_char_buf[r][c];
 
             if (cell_col != cur_col) {
-                const char *ansi = ANSI_TABLE[cell_col];
-                size_t len = strlen(ansi);
-                memcpy(g_out_buf + pos, ansi, len);
-                pos += len;
+                if (g_use_color) {
+                    const char *ansi = ANSI_TABLE[cell_col];
+                    size_t len = strlen(ansi);
+                    memcpy(g_out_buf + pos, ansi, len);
+                    pos += len;
+                }
                 cur_col = cell_col;
             }
 
@@ -817,13 +830,18 @@ static void render_frame(void) {
 }
 
 /* =========================================================================
- * MOTEUR AUDIO PROCÉDURAL HALAL (ALSA / APLAY)
+ * PROCEDURAL AUDIO ENGINE (ALSA / APLAY)
  * ========================================================================= */
 static void start_halal_ocean_ambience(void) {
     pid_t pid = fork();
     if (pid < 0) return;
 
     if (pid == 0) {
+        /* The parent's SIGINT/SIGTERM handlers only set a flag this loop never
+         * checks, so restore defaults or the parent's SIGTERM is ignored. */
+        signal(SIGINT,  SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+
         FILE *pipe = popen("aplay -q -f S16_LE -r 22050 -c 1 2>/dev/null", "w");
         if (!pipe) _exit(0);
 
@@ -885,9 +903,88 @@ static void stop_halal_ocean_ambience(void) {
 }
 
 /* =========================================================================
- * POINT D'ENTRÉE PRINCIPAL (main)
+ * ENTRY POINT (main)
  * ========================================================================= */
-int main(void) {
+static void usage(const char *prog) {
+    printf("Usage: %s [options]\n\n"
+           "Options:\n"
+           "  -s, --sound   play procedural ocean ambience (needs aplay)\n"
+           "  -h, --help    show this help\n\n"
+           "Controls: q or Ctrl+C to quit.\n"
+           "Environment: NO_COLOR=1 disables colors.\n", prog);
+}
+
+static void enable_raw_input(void) {
+    if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &g_saved_termios) != 0) return;
+    struct termios raw = g_saved_termios;
+    raw.c_lflag &= (tcflag_t)~(ICANON | ECHO); /* keep ISIG so Ctrl+C still works */
+    raw.c_cc[VMIN]  = 0;
+    raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) g_raw_enabled = 1;
+}
+
+static void restore_input(void) {
+    if (g_raw_enabled) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_termios);
+        g_raw_enabled = 0;
+    }
+}
+
+static void poll_input(void) {
+    if (!g_raw_enabled) return;
+    char c;
+    while (read(STDIN_FILENO, &c, 1) == 1) {
+        if (c == 'q' || c == 'Q') g_running = 0;
+    }
+}
+
+static void show_too_small(void) {
+    char msg[96];
+    int n = snprintf(msg, sizeof(msg),
+                     "\x1b[2J\x1b[1;1Hc-reef: terminal too small (need %dx%d)", MIN_COLS, MIN_ROWS);
+    if (n > 0) {
+        ssize_t u = write(STDOUT_FILENO, msg, (size_t)n);
+        (void)u;
+    }
+}
+
+/* Absolute-deadline pacing: sleep time absorbs the work done per frame. */
+static void advance_deadline(struct timespec *next) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    next->tv_nsec += FRAME_NS;
+    while (next->tv_nsec >= 1000000000L) {
+        next->tv_nsec -= 1000000000L;
+        next->tv_sec++;
+    }
+    /* Fell behind (suspend, slow terminal): resync instead of bursting. */
+    if (now.tv_sec > next->tv_sec ||
+        (now.tv_sec == next->tv_sec && now.tv_nsec > next->tv_nsec)) {
+        *next = now;
+    }
+}
+
+int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--sound") == 0) {
+            g_sound = 1;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            usage(argv[0]);
+            return 0;
+        } else {
+            fprintf(stderr, "c-reef: unknown option '%s'\nTry '%s --help'.\n", argv[i], argv[0]);
+            return 2;
+        }
+    }
+
+    if (!isatty(STDOUT_FILENO)) {
+        fprintf(stderr, "c-reef: stdout is not a terminal\n");
+        return 1;
+    }
+
+    const char *no_color = getenv("NO_COLOR");
+    if (no_color && no_color[0] != '\0') g_use_color = 0;
+
     srand((unsigned int)time(NULL));
 
     struct sigaction sa;
@@ -901,36 +998,50 @@ int main(void) {
     sa_winch.sa_handler = handle_winch;
     sigaction(SIGWINCH, &sa_winch, NULL);
 
-    allocate_buffers();
+    g_buffers_ok = allocate_buffers();
+    if (!g_buffers_ok) {
+        fprintf(stderr, "c-reef: terminal too small (need at least %dx%d)\n", MIN_COLS, MIN_ROWS);
+        return 1;
+    }
     populate_aquarium();
-    start_halal_ocean_ambience();
+    if (g_sound) start_halal_ocean_ambience();
+    enable_raw_input();
 
     const char *init_seq = "\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[2J";
     ssize_t u1 = write(STDOUT_FILENO, init_seq, strlen(init_seq));
     (void)u1;
 
-    struct timespec ts;
-    ts.tv_sec  = 0;
-    ts.tv_nsec = FRAME_NS;
+    struct timespec next;
+    clock_gettime(CLOCK_MONOTONIC, &next);
 
     while (g_running) {
         if (g_resized) {
             g_resized = 0;
             free_buffers();
-            allocate_buffers();
-            populate_aquarium();
-            ssize_t u_clr = write(STDOUT_FILENO, "\x1b[2J", 4);
-            (void)u_clr;
+            g_buffers_ok = allocate_buffers();
+            if (g_buffers_ok) {
+                populate_aquarium();
+                ssize_t u_clr = write(STDOUT_FILENO, "\x1b[2J", 4);
+                (void)u_clr;
+            } else {
+                show_too_small();
+            }
         }
 
-        update_simulation();
-        render_frame();
+        poll_input();
 
-        g_tick++;
-        nanosleep(&ts, NULL);
+        if (g_buffers_ok) {
+            update_simulation();
+            render_frame();
+            g_tick++;
+        }
+
+        advance_deadline(&next);
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
     }
 
     stop_halal_ocean_ambience();
+    restore_input();
 
     const char *exit_seq = "\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l\r\n";
     ssize_t u2 = write(STDOUT_FILENO, exit_seq, strlen(exit_seq));

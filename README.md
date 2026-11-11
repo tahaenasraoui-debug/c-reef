@@ -37,7 +37,7 @@
 * **Zero-Flicker Alternate Screen Rendering:** Maintains separate 2D character and ANSI color matrices in memory. Renders inside the terminal's alternate screen buffer (`\x1b[?1049h`) with explicit per-row coordinate addressing (`\x1b[row;1H`) and single-pass `write()` calls—eliminating flicker and line-wrap scrolling.
 * **True Sprite Transparency & Edge Clipping:** Internal whitespace (`' '`) inside multi-line sprite bounding boxes never overwrites background kelp, rising bubbles, or overlapping fish. Sprites enter and exit terminal borders seamlessly.
 * **Dynamic `SIGWINCH` Resizing:** Queries `ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws)` to dynamically reallocate buffers and regenerate the seabed in real time when you resize or tile your terminal window.
-* **Procedural Halal Ocean Ambience:** Forks a lightweight background PCM synthesizer piped to `aplay` that mathematically generates low-pass filtered brown noise (deep ocean swells) and natural Minnaert bubble resonance—100% free of musical instruments or external audio files.
+* **Procedural Halal Ocean Ambience (opt-in with `--sound`):** Forks a lightweight background PCM synthesizer piped to `aplay` that mathematically generates low-pass filtered brown noise (deep ocean swells) and natural Minnaert bubble resonance—100% free of musical instruments or external audio files.
 
 ---
 
@@ -65,11 +65,11 @@
 ### Prerequisites
 * A Linux / POSIX operating system with a UTF-8 terminal emulator (Konsole, Alacritty, Kitty, GNOME Terminal, etc.).
 * `gcc` (or `clang`) and `make`
-* `alsa-utils` (`aplay`) for procedural underwater audio (runs silently if `aplay` is absent).
+* `alsa-utils` (`aplay`) for procedural underwater audio, only used with `--sound` (runs silently if `aplay` is absent).
 
 ### Clone & Build
 ```bash
-git clone [https://github.com/tahaenasraoui-debug/c-reef.git](https://github.com/tahaenasraoui-debug/c-reef.git)
+git clone https://github.com/tahaenasraoui-debug/c-reef.git
 cd c-reef
 make
 ```
@@ -77,12 +77,24 @@ make
 
 ### Run
 ```bash
-./c-reef
+./c-reef            # silent
+./c-reef --sound    # with procedural ocean ambience (needs aplay)
 ```
 
+Optional system-wide install: `sudo make install` (`PREFIX=~/.local make install` for a user install).
+
+### Options
+| Flag | Effect |
+| :--- | :--- |
+| `-s`, `--sound` | Play the procedural ocean ambience (off by default). |
+| `-h`, `--help` | Show usage. |
+
+Set `NO_COLOR=1` to disable all colors. The terminal must be at least 30x12; smaller windows show a notice instead of the tank and the animation resumes when you enlarge them.
+
 ### Controls
+* **`q`:** Quits with the same clean shutdown as `Ctrl + C`.
 * **Resize Window:** Freely resize or tile your terminal; `c-reef` adapts automatically via `SIGWINCH`.
-* **`Ctrl + C`:** Cleanly terminates the simulation, stops the background audio child process, restores the terminal cursor (`\x1b[?25h`), exits the alternate screen buffer (`\x1b[?1049l`), and resets ANSI styling (`\x1b[0m`).
+* **`Ctrl + C`:** Cleanly terminates the simulation, stops the background audio child process (if `--sound` is on), restores the terminal cursor (`\x1b[?25h`), exits the alternate screen buffer (`\x1b[?1049l`), and resets ANSI styling (`\x1b[0m`).
 
 ---
 
