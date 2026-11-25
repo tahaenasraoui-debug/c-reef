@@ -1,14 +1,17 @@
 #define _POSIX_C_SOURCE 200112L
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <signal.h>
 #include <sys/ioctl.h>
-#include <termios.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
-#include <math.h>
+#include <unistd.h>
 
 /* =========================================================================
  * CONSTANTS & ANSI PALETTE
@@ -39,7 +42,8 @@ enum ColorID {
     COL_CRAB,         /* \x1b[91m - Crustacean Crimson */
     COL_KELP,         /* \x1b[92m - Vivid Green */
     COL_SAND,         /* \x1b[33m - Dark Khaki */
-    COL_ROCK          /* \x1b[90m - Dim Gray */
+    COL_ROCK,         /* \x1b[90m - Dim Gray */
+    COL_COUNT
 };
 
 static const char *ANSI_TABLE[] = {
@@ -269,7 +273,7 @@ static Entity g_entities[MAX_ENTITIES];
 static Bubble g_bubbles[MAX_BUBBLES];
 static Kelp   g_kelps[MAX_KELP];
 static int    g_num_kelps = 0;
-static long   g_tick = 0;
+static unsigned long g_tick = 0;
 static pid_t  g_audio_pid = -1;
 static int    g_sound = 0;        /* --sound */
 static int    g_use_color = 1;    /* cleared by NO_COLOR */
@@ -290,7 +294,22 @@ static void handle_winch(int sig) {
     g_resized = 1;
 }
 
+static void write_all(int fd, const char *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n > 0) {
+            off += (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+}
+
 static float randf(float min_v, float max_v) {
+    if (max_v <= min_v) return min_v;
     return min_v + ((float)rand() / (float)RAND_MAX) * (max_v - min_v);
 }
 
@@ -310,6 +329,7 @@ static void free_buffers(void) {
     free(g_sand_col1); g_sand_col1 = NULL;
     free(g_sand_col2); g_sand_col2 = NULL;
     free(g_out_buf);   g_out_buf = NULL;
+    g_out_buf_cap = 0;
 }
 
 static void init_seabed(void) {
@@ -350,7 +370,7 @@ static void init_seabed(void) {
     }
 }
 
-/* Returns 1 on success, 0 if the terminal is smaller than MIN_COLS x MIN_ROWS. */
+/* Returns 1 on success, 0 if smaller than MIN_COLS x MIN_ROWS, -1 on OOM. */
 static int allocate_buffers(void) {
     struct winsize ws;
     int w = 80, h = 24; /* fallback if the size cannot be queried */
@@ -359,23 +379,44 @@ static int allocate_buffers(void) {
         h = ws.ws_row;
     }
     if (w < MIN_COLS || h < MIN_ROWS) return 0;
+
+    size_t sw = (size_t)w;
+    size_t sh = (size_t)h;
+    if (sh > SIZE_MAX / sizeof(char *) ||
+        sw > (SIZE_MAX - 16384U) / (sh * 24U)) {
+        return -1;
+    }
+
     g_width  = w;
     g_height = h;
 
-    g_char_buf = malloc(sizeof(char *) * g_height);
-    g_col_buf  = malloc(sizeof(unsigned char *) * g_height);
+    g_char_buf = calloc(sh, sizeof(char *));
+    g_col_buf  = calloc(sh, sizeof(unsigned char *));
+    if (!g_char_buf || !g_col_buf) {
+        free_buffers();
+        return -1;
+    }
     for (int r = 0; r < g_height; r++) {
-        g_char_buf[r] = malloc(g_width);
-        g_col_buf[r]  = malloc(g_width);
+        g_char_buf[r] = malloc(sw);
+        g_col_buf[r]  = malloc(sw);
+        if (!g_char_buf[r] || !g_col_buf[r]) {
+            free_buffers();
+            return -1;
+        }
     }
 
-    g_sand_row1 = malloc(g_width);
-    g_sand_row2 = malloc(g_width);
-    g_sand_col1 = malloc(g_width);
-    g_sand_col2 = malloc(g_width);
+    g_sand_row1 = malloc(sw);
+    g_sand_row2 = malloc(sw);
+    g_sand_col1 = malloc(sw);
+    g_sand_col2 = malloc(sw);
 
-    g_out_buf_cap = (size_t)g_width * (size_t)g_height * 24 + 16384;
-    g_out_buf = malloc(g_out_buf_cap);
+    size_t cap = sw * sh * 24U + 16384U;
+    g_out_buf = malloc(cap);
+    if (!g_sand_row1 || !g_sand_row2 || !g_sand_col1 || !g_sand_col2 || !g_out_buf) {
+        free_buffers();
+        return -1;
+    }
+    g_out_buf_cap = cap;
 
     init_seabed();
     return 1;
@@ -384,7 +425,7 @@ static int allocate_buffers(void) {
 /* =========================================================================
  * SPRITE RENDERING WITH TRANSPARENCY & STRICT CLIPPING
  * ========================================================================= */
-#define DEGREE_TOKEN ((char)-1)
+#define DEGREE_TOKEN '\x01'
 
 static void draw_sprite_line(int row, int col_start, const char *line, unsigned char default_col, SpeciesType type) {
     if (row < 0 || row >= g_height - 2) return;
@@ -466,7 +507,7 @@ static void draw_entity(const Entity *e) {
         int draw_x = base_x;
 
         if (e->type == SPECIES_EEL) {
-            draw_y += (int)roundf(sinf(e->phase + r * 1.4f) * 0.6f);
+            draw_y += (int)roundf(sinf(e->phase + (float)r * 1.4f) * 0.6f);
         }
         draw_sprite_line(draw_y, draw_x, sprite[r], col, e->type);
     }
@@ -493,9 +534,11 @@ static int count_species(SpeciesType t) {
 static void spawn_minnow_school(int initial) {
     int pack_size = 3 + (rand() % 3);
     int dir = (rand() % 2 == 0) ? 1 : -1;
-    float base_x = initial ? randf(5.0f, (float)(g_width - 15))
-    : (dir > 0 ? -8.0f : (float)(g_width + 4));
-    float base_y = randf(2.0f, (float)(g_height * 0.55f));
+    float max_x = (float)(g_width - 15);
+    if (max_x < 5.0f) max_x = 5.0f;
+    float base_x = initial ? randf(5.0f, max_x)
+                           : (dir > 0 ? -8.0f : (float)(g_width + 4));
+    float base_y = randf(2.0f, (float)g_height * 0.55f);
     float speed = randf(0.85f, 1.25f) * (float)dir;
     float shared_phase = randf(0.0f, 6.28f);
 
@@ -503,6 +546,7 @@ static void spawn_minnow_school(int initial) {
         int idx = find_free_slot();
         if (idx < 0) break;
         Entity *e = &g_entities[idx];
+        memset(e, 0, sizeof(*e));
         e->active = 1;
         e->type   = SPECIES_MINNOW;
         e->dir    = dir;
@@ -512,6 +556,11 @@ static void spawn_minnow_school(int initial) {
         e->vy     = 0.0f;
         e->phase  = shared_phase + (float)i * 0.35f;
     }
+}
+
+static float clamp_rand_y(float min_y, float max_y) {
+    if (max_y < min_y) max_y = min_y;
+    return randf(min_y, max_y);
 }
 
 static void spawn_single_species(SpeciesType type, int initial) {
@@ -527,76 +576,88 @@ static void spawn_single_species(SpeciesType type, int initial) {
 
     int sea_bottom = g_height - 2;
     int margin = 28;
+    float fdir = (float)e->dir;
 
     switch (type) {
         case SPECIES_GUPPY:
-            e->vx = randf(0.45f, 0.70f) * e->dir;
-            e->y  = randf(2.0f, (float)(sea_bottom - 8));
+            e->vx = randf(0.45f, 0.70f) * fdir;
+            e->y  = clamp_rand_y(2.0f, (float)(sea_bottom - 8));
             margin = 10;
             break;
         case SPECIES_PUFFER:
-            e->vx = randf(0.18f, 0.30f) * e->dir;
-            e->y  = randf(3.0f, (float)(sea_bottom - 9));
+            e->vx = randf(0.18f, 0.30f) * fdir;
+            e->y  = clamp_rand_y(2.0f, (float)(sea_bottom - 9));
             margin = 12;
             break;
         case SPECIES_ANGEL:
-            e->vx = randf(0.28f, 0.45f) * e->dir;
-            e->y  = randf((float)(g_height * 0.2f), (float)(g_height * 0.65f));
+            e->vx = randf(0.28f, 0.45f) * fdir;
+            e->y  = clamp_rand_y((float)g_height * 0.2f, (float)g_height * 0.65f);
             margin = 10;
             break;
         case SPECIES_CLOWN:
-            e->vx = randf(0.32f, 0.52f) * e->dir;
-            e->y  = randf((float)(g_height * 0.25f), (float)(sea_bottom - 7));
+            e->vx = randf(0.32f, 0.52f) * fdir;
+            e->y  = clamp_rand_y((float)g_height * 0.25f, (float)(sea_bottom - 7));
             margin = 18;
             break;
-        case SPECIES_EEL:
-            e->vx = randf(0.35f, 0.55f) * e->dir;
-            e->y  = randf((float)(g_height * 0.68f), (float)(sea_bottom - 4));
+        case SPECIES_EEL: {
+            float max_y = (float)(sea_bottom - 4);
+            float min_y = (float)g_height * 0.68f;
+            if (min_y > max_y) min_y = max_y;
+            e->vx = randf(0.35f, 0.55f) * fdir;
+            e->y  = clamp_rand_y(min_y, max_y);
             if (e->y < 3.0f) e->y = 3.0f;
             margin = 24;
-        break;
+            break;
+        }
         case SPECIES_SWORD:
-            e->vx = randf(0.75f, 1.10f) * e->dir;
-            e->y  = randf(2.0f, (float)(g_height * 0.55f));
+            e->vx = randf(0.75f, 1.10f) * fdir;
+            e->y  = clamp_rand_y(2.0f, (float)g_height * 0.55f);
             margin = 20;
             break;
         case SPECIES_FLOUNDER:
-            e->vx = randf(0.22f, 0.38f) * e->dir;
+            e->vx = randf(0.22f, 0.38f) * fdir;
             e->y  = (float)(sea_bottom - 4);
             if (e->y < 2.0f) e->y = 2.0f;
             margin = 18;
-        break;
+            break;
         case SPECIES_TUNA:
-            e->vx = randf(0.65f, 0.95f) * e->dir;
-            e->y  = randf(3.0f, (float)(g_height * 0.60f));
+            e->vx = randf(0.65f, 0.95f) * fdir;
+            e->y  = clamp_rand_y(3.0f, (float)g_height * 0.60f);
             margin = 25;
             break;
         case SPECIES_SHARK:
-            e->vx = randf(0.22f, 0.34f) * e->dir;
-            e->y  = randf((float)(g_height * 0.30f), (float)(g_height * 0.62f));
+            e->vx = randf(0.22f, 0.34f) * fdir;
+            e->y  = clamp_rand_y((float)g_height * 0.30f, (float)g_height * 0.62f);
             margin = 30;
             break;
-        case SPECIES_SQUID:
-            e->vx = randf(0.18f, 0.32f) * e->dir;
+        case SPECIES_SQUID: {
+            float max_y = (float)(sea_bottom - 9);
+            float min_y = (float)g_height * 0.35f;
+            if (max_y < 2.0f) max_y = 2.0f;
+            if (min_y > max_y) min_y = max_y;
+            e->vx = randf(0.18f, 0.32f) * fdir;
             e->vy = -0.35f;
-            e->y  = randf((float)(g_height * 0.35f), (float)(sea_bottom - 9));
+            e->y  = clamp_rand_y(min_y, max_y);
             e->anim_timer = 20 + (rand() % 25);
             margin = 16;
             break;
+        }
         case SPECIES_CRAB:
-            e->vx = randf(0.12f, 0.22f) * e->dir;
+            e->vx = randf(0.12f, 0.22f) * fdir;
             e->y  = (float)(sea_bottom - 5);
             if (e->y < 1.0f) e->y = 1.0f;
             e->anim_timer = 15;
-        e->anim_frame = 0;
-        margin = 16;
-        break;
+            e->anim_frame = 0;
+            margin = 16;
+            break;
         default:
             break;
     }
 
     if (initial) {
-        e->x = randf(2.0f, (float)(g_width - 15));
+        float max_x = (float)(g_width - 15);
+        if (max_x < 2.0f) max_x = 2.0f;
+        e->x = randf(2.0f, max_x);
     } else {
         e->x = (e->dir > 0) ? (float)(-margin) : (float)(g_width + 3);
     }
@@ -720,13 +781,13 @@ static void update_simulation(void) {
                 e->y = (float)(sea_bottom - 5);
                 if (e->y < 1.0f) e->y = 1.0f;
                 e->anim_timer--;
-            if (e->anim_timer <= 0) {
-                e->anim_frame = !e->anim_frame;
-                e->anim_timer = 12 + (rand() % 14);
-            }
-            if (e->x < 2.0f && e->dir < 0) { e->dir = 1; e->vx = -e->vx; }
-            if (e->x > (float)(g_width - 16) && e->dir > 0) { e->dir = -1; e->vx = -e->vx; }
-            break;
+                if (e->anim_timer <= 0) {
+                    e->anim_frame = !e->anim_frame;
+                    e->anim_timer = 12 + (rand() % 14);
+                }
+                if (e->x < 2.0f && e->dir < 0) { e->dir = 1; e->vx = -e->vx; }
+                if (e->x > (float)(g_width - 16) && e->dir > 0) { e->dir = -1; e->vx = -e->vx; }
+                break;
             default:
                 break;
         }
@@ -734,7 +795,7 @@ static void update_simulation(void) {
         if ((e->dir > 0 && e->x > (float)(g_width + 6)) ||
             (e->dir < 0 && e->x < -34.0f)) {
             e->active = 0;
-            }
+        }
     }
 
     maintain_population();
@@ -743,19 +804,33 @@ static void update_simulation(void) {
 /* =========================================================================
  * IN-MEMORY DOUBLE-BUFFER RENDER PIPELINE
  * ========================================================================= */
+static void out_append(size_t *pos, const char *data, size_t len) {
+    if (*pos < g_out_buf_cap && len <= g_out_buf_cap - *pos) {
+        memcpy(g_out_buf + *pos, data, len);
+        *pos += len;
+    }
+}
+
+static void out_append_char(size_t *pos, char ch) {
+    if (*pos < g_out_buf_cap) {
+        g_out_buf[(*pos)++] = ch;
+    }
+}
+
 static void render_frame(void) {
+    size_t row_bytes = (size_t)g_width;
     for (int r = 0; r < g_height; r++) {
-        memset(g_char_buf[r], ' ', g_width);
-        memset(g_col_buf[r], COL_RESET, g_width);
+        memset(g_char_buf[r], ' ', row_bytes);
+        memset(g_col_buf[r], COL_RESET, row_bytes);
     }
 
     int sea_bottom = g_height - 2;
 
     if (g_height >= 2) {
-        memcpy(g_char_buf[g_height - 2], g_sand_row1, g_width);
-        memcpy(g_col_buf[g_height - 2],  g_sand_col1, g_width);
-        memcpy(g_char_buf[g_height - 1], g_sand_row2, g_width);
-        memcpy(g_col_buf[g_height - 1],  g_sand_col2, g_width);
+        memcpy(g_char_buf[g_height - 2], g_sand_row1, row_bytes);
+        memcpy(g_col_buf[g_height - 2],  g_sand_col1, row_bytes);
+        memcpy(g_char_buf[g_height - 1], g_sand_row2, row_bytes);
+        memcpy(g_col_buf[g_height - 1],  g_sand_col2, row_bytes);
     }
 
     const char kelp_glyphs[] = "(){}";
@@ -766,7 +841,7 @@ static void render_frame(void) {
             float sway = sinf((float)g_tick * 0.08f + g_kelps[i].phase + (float)h * 0.45f);
             int col = g_kelps[i].x + (int)roundf(sway * 1.15f);
             if (col >= 0 && col < g_width) {
-                char kc = kelp_glyphs[(h + (int)(g_tick / 12)) % 4];
+                char kc = kelp_glyphs[((unsigned long)h + (g_tick / 12UL)) % 4UL];
                 g_char_buf[row][col] = kc;
                 g_col_buf[row][col]  = COL_KELP;
             }
@@ -793,8 +868,12 @@ static void render_frame(void) {
     unsigned char cur_col = 255;
 
     for (int r = 0; r < g_height; r++) {
-        int n = snprintf(g_out_buf + pos, 16, "\x1b[%d;1H", r + 1);
-        if (n > 0) pos += (size_t)n;
+        char row_seq[16];
+        int n = snprintf(row_seq, sizeof(row_seq), "\x1b[%d;1H", r + 1);
+        if (n > 0) {
+            size_t slen = (n >= (int)sizeof(row_seq)) ? (sizeof(row_seq) - 1) : (size_t)n;
+            out_append(&pos, row_seq, slen);
+        }
 
         int safe_cols = (g_width > 1) ? (g_width - 1) : g_width;
         for (int c = 0; c < safe_cols; c++) {
@@ -802,45 +881,74 @@ static void render_frame(void) {
             char ch = g_char_buf[r][c];
 
             if (cell_col != cur_col) {
-                if (g_use_color) {
+                if (g_use_color && cell_col < COL_COUNT) {
                     const char *ansi = ANSI_TABLE[cell_col];
-                    size_t len = strlen(ansi);
-                    memcpy(g_out_buf + pos, ansi, len);
-                    pos += len;
+                    out_append(&pos, ansi, strlen(ansi));
                 }
                 cur_col = cell_col;
             }
 
             if (ch == DEGREE_TOKEN) {
-                g_out_buf[pos++] = '\xc2';
-                g_out_buf[pos++] = '\xb0';
+                out_append_char(&pos, '\xc2');
+                out_append_char(&pos, '\xb0');
             } else {
-                g_out_buf[pos++] = ch;
+                out_append_char(&pos, ch);
             }
         }
     }
 
-    const char *rst = ANSI_TABLE[COL_RESET];
-    size_t rlen = strlen(rst);
-    memcpy(g_out_buf + pos, rst, rlen);
-    pos += rlen;
+    if (g_use_color) {
+        const char *rst = ANSI_TABLE[COL_RESET];
+        out_append(&pos, rst, strlen(rst));
+    }
 
-    ssize_t unused = write(STDOUT_FILENO, g_out_buf, pos);
-    (void)unused;
+    write_all(STDOUT_FILENO, g_out_buf, pos);
 }
 
 /* =========================================================================
  * PROCEDURAL AUDIO ENGINE (ALSA / APLAY)
  * ========================================================================= */
 static void start_halal_ocean_ambience(void) {
+    sigset_t block_mask, old_mask;
+    sigemptyset(&block_mask);
+    sigaddset(&block_mask, SIGINT);
+    sigaddset(&block_mask, SIGTERM);
+    sigaddset(&block_mask, SIGHUP);
+    sigaddset(&block_mask, SIGWINCH);
+    sigprocmask(SIG_BLOCK, &block_mask, &old_mask);
+
     pid_t pid = fork();
-    if (pid < 0) return;
+    if (pid < 0) {
+        sigprocmask(SIG_SETMASK, &old_mask, NULL);
+        return;
+    }
 
     if (pid == 0) {
-        /* The parent's SIGINT/SIGTERM handlers only set a flag this loop never
-         * checks, so restore defaults or the parent's SIGTERM is ignored. */
-        signal(SIGINT,  SIG_DFL);
-        signal(SIGTERM, SIG_DFL);
+        /* Isolate into its own process group and detach from the terminal
+         * so aplay/sh cannot write to the PTY or ignore group termination. */
+        setpgid(0, 0);
+
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > STDERR_FILENO) close(devnull);
+        }
+
+        /* Restore default signal dispositions BEFORE unblocking signals so a
+         * parent SIGTERM cannot hit the inherited handler during startup. */
+        struct sigaction dfl;
+        memset(&dfl, 0, sizeof(dfl));
+        dfl.sa_handler = SIG_DFL;
+        sigaction(SIGINT,   &dfl, NULL);
+        sigaction(SIGTERM,  &dfl, NULL);
+        sigaction(SIGHUP,   &dfl, NULL);
+        sigaction(SIGWINCH, &dfl, NULL);
+        dfl.sa_handler = SIG_IGN;
+        sigaction(SIGPIPE,  &dfl, NULL);
+
+        sigprocmask(SIG_SETMASK, &old_mask, NULL);
 
         FILE *pipe = popen("aplay -q -f S16_LE -r 22050 -c 1 2>/dev/null", "w");
         if (!pipe) _exit(0);
@@ -883,23 +991,32 @@ static void start_halal_ocean_ambience(void) {
                 buffer[i] = (short)sample;
             }
 
-            if (fwrite(buffer, sizeof(short), 1024, pipe) != 1024) break;
-            fflush(pipe);
+            if (fwrite(buffer, sizeof(short), 1024, pipe) != 1024 || fflush(pipe) != 0) break;
         }
 
         pclose(pipe);
         _exit(0);
     } else {
+        setpgid(pid, pid);
         g_audio_pid = pid;
+        sigprocmask(SIG_SETMASK, &old_mask, NULL);
     }
 }
 
 static void stop_halal_ocean_ambience(void) {
-    if (g_audio_pid > 0) {
-        kill(g_audio_pid, SIGTERM);
-        waitpid(g_audio_pid, NULL, 0);
-        g_audio_pid = -1;
+    if (g_audio_pid <= 0) return;
+
+    pid_t wp;
+    while ((wp = waitpid(g_audio_pid, NULL, WNOHANG)) < 0 && errno == EINTR) {
     }
+    if (wp == 0) {
+        if (kill(-g_audio_pid, SIGTERM) != 0) {
+            kill(g_audio_pid, SIGTERM);
+        }
+        while (waitpid(g_audio_pid, NULL, 0) < 0 && errno == EINTR) {
+        }
+    }
+    g_audio_pid = -1;
 }
 
 /* =========================================================================
@@ -915,17 +1032,25 @@ static void usage(const char *prog) {
 }
 
 static void enable_raw_input(void) {
-    if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &g_saved_termios) != 0) return;
+    if (!isatty(STDIN_FILENO)) return;
+    int rc;
+    while ((rc = tcgetattr(STDIN_FILENO, &g_saved_termios)) < 0 && errno == EINTR) {
+    }
+    if (rc != 0) return;
+
     struct termios raw = g_saved_termios;
     raw.c_lflag &= (tcflag_t)~(ICANON | ECHO); /* keep ISIG so Ctrl+C still works */
     raw.c_cc[VMIN]  = 0;
     raw.c_cc[VTIME] = 0;
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) g_raw_enabled = 1;
+    while ((rc = tcsetattr(STDIN_FILENO, TCSANOW, &raw)) < 0 && errno == EINTR) {
+    }
+    if (rc == 0) g_raw_enabled = 1;
 }
 
 static void restore_input(void) {
     if (g_raw_enabled) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_termios);
+        while (tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_termios) < 0 && errno == EINTR) {
+        }
         g_raw_enabled = 0;
     }
 }
@@ -933,8 +1058,19 @@ static void restore_input(void) {
 static void poll_input(void) {
     if (!g_raw_enabled) return;
     char c;
-    while (read(STDIN_FILENO, &c, 1) == 1) {
-        if (c == 'q' || c == 'Q') g_running = 0;
+    for (;;) {
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n == 1) {
+            if (c == 'q' || c == 'Q') {
+                g_running = 0;
+                break;
+            }
+        } else if (n < 0 && errno == EINTR) {
+            if (!g_running) break;
+            continue;
+        } else {
+            break;
+        }
     }
 }
 
@@ -943,8 +1079,8 @@ static void show_too_small(void) {
     int n = snprintf(msg, sizeof(msg),
                      "\x1b[2J\x1b[1;1Hc-reef: terminal too small (need %dx%d)", MIN_COLS, MIN_ROWS);
     if (n > 0) {
-        ssize_t u = write(STDOUT_FILENO, msg, (size_t)n);
-        (void)u;
+        size_t len = (n >= (int)sizeof(msg)) ? (sizeof(msg) - 1) : (size_t)n;
+        write_all(STDOUT_FILENO, msg, len);
     }
 }
 
@@ -965,14 +1101,16 @@ static void advance_deadline(struct timespec *next) {
 }
 
 int main(int argc, char **argv) {
+    const char *prog = (argc > 0 && argv[0]) ? argv[0] : "c-reef";
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--sound") == 0) {
             g_sound = 1;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            usage(argv[0]);
+            usage(prog);
             return 0;
         } else {
-            fprintf(stderr, "c-reef: unknown option '%s'\nTry '%s --help'.\n", argv[i], argv[0]);
+            fprintf(stderr, "c-reef: unknown option '%s'\nTry '%s --help'.\n", argv[i], prog);
             return 2;
         }
     }
@@ -993,42 +1131,60 @@ int main(int argc, char **argv) {
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
+    struct sigaction old_hup;
+    if (sigaction(SIGHUP, NULL, &old_hup) == 0 && old_hup.sa_handler != SIG_IGN) {
+        sigaction(SIGHUP, &sa, NULL);
+    }
+
     struct sigaction sa_winch;
     memset(&sa_winch, 0, sizeof(sa_winch));
     sa_winch.sa_handler = handle_winch;
     sigaction(SIGWINCH, &sa_winch, NULL);
 
-    g_buffers_ok = allocate_buffers();
-    if (!g_buffers_ok) {
+    int buf_rc = allocate_buffers();
+    if (buf_rc == 0) {
         fprintf(stderr, "c-reef: terminal too small (need at least %dx%d)\n", MIN_COLS, MIN_ROWS);
         return 1;
     }
+    if (buf_rc < 0) {
+        fprintf(stderr, "c-reef: out of memory\n");
+        return 1;
+    }
+    g_buffers_ok = 1;
+
     populate_aquarium();
     if (g_sound) start_halal_ocean_ambience();
     enable_raw_input();
 
     const char *init_seq = "\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[2J";
-    ssize_t u1 = write(STDOUT_FILENO, init_seq, strlen(init_seq));
-    (void)u1;
+    write_all(STDOUT_FILENO, init_seq, strlen(init_seq));
 
     struct timespec next;
     clock_gettime(CLOCK_MONOTONIC, &next);
 
+    int exit_code = 0;
     while (g_running) {
         if (g_resized) {
             g_resized = 0;
             free_buffers();
-            g_buffers_ok = allocate_buffers();
-            if (g_buffers_ok) {
+            buf_rc = allocate_buffers();
+            if (buf_rc > 0) {
+                g_buffers_ok = 1;
                 populate_aquarium();
-                ssize_t u_clr = write(STDOUT_FILENO, "\x1b[2J", 4);
-                (void)u_clr;
-            } else {
+                write_all(STDOUT_FILENO, "\x1b[2J", 4);
+            } else if (buf_rc == 0) {
+                g_buffers_ok = 0;
                 show_too_small();
+            } else {
+                g_buffers_ok = 0;
+                exit_code = 1;
+                g_running = 0;
+                break;
             }
         }
 
         poll_input();
+        if (!g_running) break;
 
         if (g_buffers_ok) {
             update_simulation();
@@ -1036,6 +1192,7 @@ int main(int argc, char **argv) {
             g_tick++;
         }
 
+        if (!g_running) break;
         advance_deadline(&next);
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
     }
@@ -1044,9 +1201,8 @@ int main(int argc, char **argv) {
     restore_input();
 
     const char *exit_seq = "\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l\r\n";
-    ssize_t u2 = write(STDOUT_FILENO, exit_seq, strlen(exit_seq));
-    (void)u2;
+    write_all(STDOUT_FILENO, exit_seq, strlen(exit_seq));
 
     free_buffers();
-    return 0;
+    return exit_code;
 }

@@ -4,7 +4,7 @@ LDFLAGS = -lm
 TARGET  = c-reef
 PREFIX  = /usr/local
 
-.PHONY: all run debug install uninstall clean
+.PHONY: all run debug test test-asan install uninstall clean
 
 all: $(TARGET)
 
@@ -16,7 +16,13 @@ run: $(TARGET)
 
 # Sanitizer build for development and CI
 debug: aquarium.c
-	$(CC) -std=c99 -O1 -g -Wall -Wextra -Wpedantic -fsanitize=address,undefined aquarium.c -o $(TARGET)-asan $(LDFLAGS)
+	$(CC) -std=c99 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Wpedantic -Werror -fsanitize=address,undefined aquarium.c -o $(TARGET)-asan $(LDFLAGS)
+
+test: $(TARGET)
+	./tests/test_cli.sh ./$(TARGET)
+
+test-asan: debug
+	./tests/test_cli.sh ./$(TARGET)-asan
 
 install: $(TARGET)
 	install -Dm755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)

@@ -1,10 +1,11 @@
 # 🐠 c-reef
 
+[![CI](https://github.com/tahaenasraoui-debug/c-reef/actions/workflows/ci.yml/badge.svg)](https://github.com/tahaenasraoui-debug/c-reef/actions/workflows/ci.yml)
 ![Language](https://img.shields.io/badge/Language-C99-00599C?style=flat-square&logo=c&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20POSIX-FCC624?style=flat-square&logo=linux&logoColor=black)
 ![Dependencies](https://img.shields.io/badge/Dependencies-Zero%20(libc%20%2B%20libm)-success?style=flat-square)
 ![FPS](https://img.shields.io/badge/Framerate-30%20FPS-00C7B7?style=flat-square)
-![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)
+[![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 
 **`c-reef`** is a zero-dependency, 30 FPS Linux terminal ASCII aquarium written in pure **C99**. It features a flicker-free double-buffered ANSI rendering engine, 12 marine species (10 fish + 2 benthic invertebrates) with custom autonomous physics, swaying sinusoidal kelp forests, rising air bubbles, and a built-in **procedural underwater acoustics synthesizer** (100% natural, instrument-free ocean surf and bubble physics).
 
@@ -73,7 +74,9 @@ git clone https://github.com/tahaenasraoui-debug/c-reef.git
 cd c-reef
 make
 ```
-*(Or compile directly with `gcc -std=c99 -O2 -Wall -Wextra aquarium.c -o c-reef -lm`)*
+*(Or compile directly with `gcc -std=c99 -O2 -Wall -Wextra -Wpedantic aquarium.c -o c-reef -lm`)*
+
+Run `make test` for the CLI/PTY test suite or `make test-asan` for the ASan/UBSan run.
 
 ### Run
 ```bash

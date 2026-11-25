@@ -5,3 +5,7 @@ aquarium
 *.out
 *.exe
 *.cast
+*.dSYM/
+compile_commands.json
+.DS_Store
+.vscode/

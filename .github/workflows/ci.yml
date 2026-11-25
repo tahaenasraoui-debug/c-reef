@@ -11,17 +11,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build
-        run: make CC=${{ matrix.cc }}
+      - name: Build (-Werror)
+        run: make CC=${{ matrix.cc }} CFLAGS="-std=c99 -O2 -Wall -Wextra -Wpedantic -Werror"
 
-      - name: Smoke test (--help)
-        run: ./c-reef --help
+      - name: Run test suite
+        run: make test
 
-      - name: Sanitizer run under a pty (SIGTERM must exit cleanly)
-        run: |
-          make debug CC=${{ matrix.cc }}
-          set +e
-          script -qec "timeout 5 ./c-reef-asan --sound" /dev/null
-          rc=$?
-          # 124 = timeout fired, which is the expected outcome
-          [ $rc -eq 124 ] || [ $rc -eq 0 ] || exit $rc
+      - name: Sanitizer build & test suite (ASan/UBSan + -Werror)
+        run: make test-asan CC=${{ matrix.cc }}
+
+      - name: Sanitizer PTY timeout test (SIGTERM must exit cleanly)
+        run: script -qec "stty cols 100 rows 30 && timeout --preserve-status 3 ./c-reef-asan --sound" /dev/null
