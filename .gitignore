@@ -4,6 +4,9 @@ aquarium
 *.o
 *.out
 *.exe
+*.spec
+dist/
+build/
 *.cast
 *.dSYM/
 compile_commands.json

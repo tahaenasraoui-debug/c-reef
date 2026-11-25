@@ -1,17 +1,30 @@
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200112L
-#include <errno.h>
-#include <fcntl.h>
+#endif
+
 #include <math.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#ifdef _WIN32
+#include <conio.h>
+#include <io.h>
+#include <windows.h>
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+#else
+#include <errno.h>
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <termios.h>
-#include <time.h>
 #include <unistd.h>
+#endif
 
 /* =========================================================================
  * CONSTANTS & ANSI PALETTE
@@ -20,7 +33,9 @@
 #define MAX_BUBBLES  120
 #define MAX_KELP     16
 #define FPS          30
+#ifndef _WIN32
 #define FRAME_NS     (1000000000L / FPS)
+#endif
 #define MIN_COLS     30
 #define MIN_ROWS     12
 
@@ -274,16 +289,177 @@ static Bubble g_bubbles[MAX_BUBBLES];
 static Kelp   g_kelps[MAX_KELP];
 static int    g_num_kelps = 0;
 static unsigned long g_tick = 0;
-static pid_t  g_audio_pid = -1;
 static int    g_sound = 0;        /* --sound */
 static int    g_use_color = 1;    /* cleared by NO_COLOR */
 static int    g_buffers_ok = 0;   /* 0 while the terminal is too small */
+#ifdef _WIN32
+static DWORD  g_saved_out_mode = 0;
+static int    g_out_mode_saved = 0;
+static UINT   g_saved_cp = 0;
+static int    g_cp_saved = 0;
+static int    g_last_term_w = 0;
+static int    g_last_term_h = 0;
+#else
+static pid_t  g_audio_pid = -1;
 static int    g_raw_enabled = 0;
 static struct termios g_saved_termios;
+#endif
 
 /* =========================================================================
- * UTILITIES & POSIX SIGNAL HANDLING
+ * UTILITIES & PLATFORM TERMINAL / SIGNAL HANDLING
  * ========================================================================= */
+#ifdef _WIN32
+static BOOL WINAPI handle_ctrl(DWORD ctrl_type) {
+    switch (ctrl_type) {
+        case CTRL_C_EVENT:
+        case CTRL_CLOSE_EVENT:
+            g_running = 0;
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
+static void install_signal_handlers(void) {
+    SetConsoleCtrlHandler(handle_ctrl, TRUE);
+}
+
+static int is_stdout_tty(void) {
+    return _isatty(_fileno(stdout)) != 0;
+}
+
+static void get_terminal_size(int *out_w, int *out_h) {
+    int w = 80;
+    int h = 24; /* fallback if redirected or unavailable */
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (hOut != INVALID_HANDLE_VALUE && hOut != NULL &&
+        GetConsoleScreenBufferInfo(hOut, &csbi)) {
+        int cw = (int)(csbi.srWindow.Right - csbi.srWindow.Left + 1);
+        int ch = (int)(csbi.srWindow.Bottom - csbi.srWindow.Top + 1);
+        if (cw > 0 && ch > 0) {
+            w = cw;
+            h = ch;
+        }
+    }
+    *out_w = w;
+    *out_h = h;
+}
+
+static void write_all(const char *buf, size_t len) {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    size_t off = 0;
+    if (hOut != INVALID_HANDLE_VALUE && hOut != NULL) {
+        while (off < len) {
+            DWORD chunk = (len - off > 65536U) ? (DWORD)65536U : (DWORD)(len - off);
+            DWORD written = 0;
+            if (!WriteFile(hOut, buf + off, chunk, &written, NULL) || written == 0) {
+                break;
+            }
+            off += (size_t)written;
+        }
+        return;
+    }
+    int fd = _fileno(stdout);
+    while (off < len) {
+        unsigned int chunk = (len - off > 65536U) ? 65536U : (unsigned int)(len - off);
+        int n = _write(fd, buf + off, chunk);
+        if (n <= 0) break;
+        off += (size_t)n;
+    }
+}
+
+static void setup_terminal(void) {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut != INVALID_HANDLE_VALUE && hOut != NULL) {
+        if (GetConsoleMode(hOut, &g_saved_out_mode)) {
+            g_out_mode_saved = 1;
+            SetConsoleMode(hOut, g_saved_out_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+    UINT cp = GetConsoleOutputCP();
+    if (cp != 0) {
+        g_saved_cp = cp;
+        g_cp_saved = 1;
+    }
+    SetConsoleOutputCP(CP_UTF8);
+}
+
+static void restore_terminal_input(void) {
+    /* Nothing to restore before writing exit_seq on Windows. */
+}
+
+static void restore_terminal_output(void) {
+    if (g_out_mode_saved) {
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (hOut != INVALID_HANDLE_VALUE && hOut != NULL) {
+            SetConsoleMode(hOut, g_saved_out_mode);
+        }
+        g_out_mode_saved = 0;
+    }
+    if (g_cp_saved) {
+        SetConsoleOutputCP(g_saved_cp);
+        g_cp_saved = 0;
+    }
+}
+
+static void poll_input(void) {
+    while (_kbhit()) {
+        int ch = _getch();
+        if (ch == 0 || ch == 0xE0) {
+            if (_kbhit()) (void)_getch(); /* discard extended key scan code */
+            continue;
+        }
+        if (ch == 'q' || ch == 'Q' || ch == 3) {
+            g_running = 0;
+            break;
+        }
+    }
+}
+
+static void poll_resize(void) {
+    int cur_w = 0;
+    int cur_h = 0;
+    get_terminal_size(&cur_w, &cur_h);
+    if (cur_w != g_last_term_w || cur_h != g_last_term_h) {
+        g_last_term_w = cur_w;
+        g_last_term_h = cur_h;
+        g_resized = 1;
+    }
+}
+
+typedef struct {
+    LARGE_INTEGER freq;
+    LARGE_INTEGER next;
+} FrameTimer;
+
+static void frame_timer_init(FrameTimer *ft) {
+    QueryPerformanceFrequency(&ft->freq);
+    QueryPerformanceCounter(&ft->next);
+}
+
+static void frame_timer_wait(FrameTimer *ft) {
+    LARGE_INTEGER now;
+    LONGLONG step = (ft->freq.QuadPart > 0) ? (ft->freq.QuadPart / FPS) : 1;
+    if (step < 1) step = 1;
+
+    ft->next.QuadPart += step;
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart >= ft->next.QuadPart) {
+        /* Fell behind: resync instead of bursting. */
+        ft->next = now;
+        return;
+    }
+
+    if (ft->freq.QuadPart > 0) {
+        LONGLONG remaining = ft->next.QuadPart - now.QuadPart;
+        DWORD ms = (DWORD)((remaining * 1000LL) / ft->freq.QuadPart);
+        if (ms > 0) {
+            Sleep(ms);
+        }
+    }
+}
+#else
 static void handle_sig(int sig) {
     (void)sig;
     g_running = 0;
@@ -294,10 +470,44 @@ static void handle_winch(int sig) {
     g_resized = 1;
 }
 
-static void write_all(int fd, const char *buf, size_t len) {
+static void install_signal_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_sig;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    struct sigaction old_hup;
+    if (sigaction(SIGHUP, NULL, &old_hup) == 0 && old_hup.sa_handler != SIG_IGN) {
+        sigaction(SIGHUP, &sa, NULL);
+    }
+
+    struct sigaction sa_winch;
+    memset(&sa_winch, 0, sizeof(sa_winch));
+    sa_winch.sa_handler = handle_winch;
+    sigaction(SIGWINCH, &sa_winch, NULL);
+}
+
+static int is_stdout_tty(void) {
+    return isatty(STDOUT_FILENO) != 0;
+}
+
+static void get_terminal_size(int *out_w, int *out_h) {
+    int w = 80;
+    int h = 24; /* fallback if the size cannot be queried */
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) {
+        w = ws.ws_col;
+        h = ws.ws_row;
+    }
+    *out_w = w;
+    *out_h = h;
+}
+
+static void write_all(const char *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
-        ssize_t n = write(fd, buf + off, len - off);
+        ssize_t n = write(STDOUT_FILENO, buf + off, len - off);
         if (n > 0) {
             off += (size_t)n;
         } else if (n < 0 && errno == EINTR) {
@@ -307,6 +517,83 @@ static void write_all(int fd, const char *buf, size_t len) {
         }
     }
 }
+
+static void setup_terminal(void) {
+    if (!isatty(STDIN_FILENO)) return;
+    int rc;
+    while ((rc = tcgetattr(STDIN_FILENO, &g_saved_termios)) < 0 && errno == EINTR) {
+    }
+    if (rc != 0) return;
+
+    struct termios raw = g_saved_termios;
+    raw.c_lflag &= (tcflag_t)~(ICANON | ECHO); /* keep ISIG so Ctrl+C still works */
+    raw.c_cc[VMIN]  = 0;
+    raw.c_cc[VTIME] = 0;
+    while ((rc = tcsetattr(STDIN_FILENO, TCSANOW, &raw)) < 0 && errno == EINTR) {
+    }
+    if (rc == 0) g_raw_enabled = 1;
+}
+
+static void restore_terminal_input(void) {
+    if (g_raw_enabled) {
+        while (tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_termios) < 0 && errno == EINTR) {
+        }
+        g_raw_enabled = 0;
+    }
+}
+
+static void restore_terminal_output(void) {
+    /* Nothing to restore after writing exit_seq on POSIX. */
+}
+
+static void poll_input(void) {
+    if (!g_raw_enabled) return;
+    char c;
+    for (;;) {
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n == 1) {
+            if (c == 'q' || c == 'Q') {
+                g_running = 0;
+                break;
+            }
+        } else if (n < 0 && errno == EINTR) {
+            if (!g_running) break;
+            continue;
+        } else {
+            break;
+        }
+    }
+}
+
+static void poll_resize(void) {
+    /* Resize is signalled asynchronously via SIGWINCH on POSIX. */
+}
+
+typedef struct {
+    struct timespec next;
+} FrameTimer;
+
+static void frame_timer_init(FrameTimer *ft) {
+    clock_gettime(CLOCK_MONOTONIC, &ft->next);
+}
+
+/* Absolute-deadline pacing: sleep time absorbs the work done per frame. */
+static void frame_timer_wait(FrameTimer *ft) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    ft->next.tv_nsec += FRAME_NS;
+    while (ft->next.tv_nsec >= 1000000000L) {
+        ft->next.tv_nsec -= 1000000000L;
+        ft->next.tv_sec++;
+    }
+    /* Fell behind (suspend, slow terminal): resync instead of bursting. */
+    if (now.tv_sec > ft->next.tv_sec ||
+        (now.tv_sec == ft->next.tv_sec && now.tv_nsec > ft->next.tv_nsec)) {
+        ft->next = now;
+    }
+    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ft->next, NULL);
+}
+#endif
 
 static float randf(float min_v, float max_v) {
     if (max_v <= min_v) return min_v;
@@ -372,12 +659,8 @@ static void init_seabed(void) {
 
 /* Returns 1 on success, 0 if smaller than MIN_COLS x MIN_ROWS, -1 on OOM. */
 static int allocate_buffers(void) {
-    struct winsize ws;
-    int w = 80, h = 24; /* fallback if the size cannot be queried */
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) {
-        w = ws.ws_col;
-        h = ws.ws_row;
-    }
+    int w = 80, h = 24;
+    get_terminal_size(&w, &h);
     if (w < MIN_COLS || h < MIN_ROWS) return 0;
 
     size_t sw = (size_t)w;
@@ -902,12 +1185,13 @@ static void render_frame(void) {
         out_append(&pos, rst, strlen(rst));
     }
 
-    write_all(STDOUT_FILENO, g_out_buf, pos);
+    write_all(g_out_buf, pos);
 }
 
 /* =========================================================================
  * PROCEDURAL AUDIO ENGINE (ALSA / APLAY)
  * ========================================================================= */
+#ifndef _WIN32
 static void start_halal_ocean_ambience(void) {
     sigset_t block_mask, old_mask;
     sigemptyset(&block_mask);
@@ -1018,6 +1302,14 @@ static void stop_halal_ocean_ambience(void) {
     }
     g_audio_pid = -1;
 }
+#else
+static void start_halal_ocean_ambience(void) {
+    fprintf(stderr, "c-reef: note: procedural ALSA audio (--sound) is Linux-only; running silently.\n");
+}
+
+static void stop_halal_ocean_ambience(void) {
+}
+#endif
 
 /* =========================================================================
  * ENTRY POINT (main)
@@ -1025,53 +1317,10 @@ static void stop_halal_ocean_ambience(void) {
 static void usage(const char *prog) {
     printf("Usage: %s [options]\n\n"
            "Options:\n"
-           "  -s, --sound   play procedural ocean ambience (needs aplay)\n"
+           "  -s, --sound   play procedural ocean ambience (Linux ALSA / aplay)\n"
            "  -h, --help    show this help\n\n"
            "Controls: q or Ctrl+C to quit.\n"
            "Environment: NO_COLOR=1 disables colors.\n", prog);
-}
-
-static void enable_raw_input(void) {
-    if (!isatty(STDIN_FILENO)) return;
-    int rc;
-    while ((rc = tcgetattr(STDIN_FILENO, &g_saved_termios)) < 0 && errno == EINTR) {
-    }
-    if (rc != 0) return;
-
-    struct termios raw = g_saved_termios;
-    raw.c_lflag &= (tcflag_t)~(ICANON | ECHO); /* keep ISIG so Ctrl+C still works */
-    raw.c_cc[VMIN]  = 0;
-    raw.c_cc[VTIME] = 0;
-    while ((rc = tcsetattr(STDIN_FILENO, TCSANOW, &raw)) < 0 && errno == EINTR) {
-    }
-    if (rc == 0) g_raw_enabled = 1;
-}
-
-static void restore_input(void) {
-    if (g_raw_enabled) {
-        while (tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_termios) < 0 && errno == EINTR) {
-        }
-        g_raw_enabled = 0;
-    }
-}
-
-static void poll_input(void) {
-    if (!g_raw_enabled) return;
-    char c;
-    for (;;) {
-        ssize_t n = read(STDIN_FILENO, &c, 1);
-        if (n == 1) {
-            if (c == 'q' || c == 'Q') {
-                g_running = 0;
-                break;
-            }
-        } else if (n < 0 && errno == EINTR) {
-            if (!g_running) break;
-            continue;
-        } else {
-            break;
-        }
-    }
 }
 
 static void show_too_small(void) {
@@ -1080,23 +1329,7 @@ static void show_too_small(void) {
                      "\x1b[2J\x1b[1;1Hc-reef: terminal too small (need %dx%d)", MIN_COLS, MIN_ROWS);
     if (n > 0) {
         size_t len = (n >= (int)sizeof(msg)) ? (sizeof(msg) - 1) : (size_t)n;
-        write_all(STDOUT_FILENO, msg, len);
-    }
-}
-
-/* Absolute-deadline pacing: sleep time absorbs the work done per frame. */
-static void advance_deadline(struct timespec *next) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    next->tv_nsec += FRAME_NS;
-    while (next->tv_nsec >= 1000000000L) {
-        next->tv_nsec -= 1000000000L;
-        next->tv_sec++;
-    }
-    /* Fell behind (suspend, slow terminal): resync instead of bursting. */
-    if (now.tv_sec > next->tv_sec ||
-        (now.tv_sec == next->tv_sec && now.tv_nsec > next->tv_nsec)) {
-        *next = now;
+        write_all(msg, len);
     }
 }
 
@@ -1115,7 +1348,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!isatty(STDOUT_FILENO)) {
+    if (!is_stdout_tty()) {
         fprintf(stderr, "c-reef: stdout is not a terminal\n");
         return 1;
     }
@@ -1124,22 +1357,7 @@ int main(int argc, char **argv) {
     if (no_color && no_color[0] != '\0') g_use_color = 0;
 
     srand((unsigned int)time(NULL));
-
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = handle_sig;
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-
-    struct sigaction old_hup;
-    if (sigaction(SIGHUP, NULL, &old_hup) == 0 && old_hup.sa_handler != SIG_IGN) {
-        sigaction(SIGHUP, &sa, NULL);
-    }
-
-    struct sigaction sa_winch;
-    memset(&sa_winch, 0, sizeof(sa_winch));
-    sa_winch.sa_handler = handle_winch;
-    sigaction(SIGWINCH, &sa_winch, NULL);
+    install_signal_handlers();
 
     int buf_rc = allocate_buffers();
     if (buf_rc == 0) {
@@ -1151,19 +1369,24 @@ int main(int argc, char **argv) {
         return 1;
     }
     g_buffers_ok = 1;
+#ifdef _WIN32
+    g_last_term_w = g_width;
+    g_last_term_h = g_height;
+#endif
 
     populate_aquarium();
     if (g_sound) start_halal_ocean_ambience();
-    enable_raw_input();
+    setup_terminal();
 
     const char *init_seq = "\x1b[?1049h\x1b[?7l\x1b[?25l\x1b[2J";
-    write_all(STDOUT_FILENO, init_seq, strlen(init_seq));
+    write_all(init_seq, strlen(init_seq));
 
-    struct timespec next;
-    clock_gettime(CLOCK_MONOTONIC, &next);
+    FrameTimer timer;
+    frame_timer_init(&timer);
 
     int exit_code = 0;
     while (g_running) {
+        poll_resize();
         if (g_resized) {
             g_resized = 0;
             free_buffers();
@@ -1171,7 +1394,7 @@ int main(int argc, char **argv) {
             if (buf_rc > 0) {
                 g_buffers_ok = 1;
                 populate_aquarium();
-                write_all(STDOUT_FILENO, "\x1b[2J", 4);
+                write_all("\x1b[2J", 4);
             } else if (buf_rc == 0) {
                 g_buffers_ok = 0;
                 show_too_small();
@@ -1193,16 +1416,16 @@ int main(int argc, char **argv) {
         }
 
         if (!g_running) break;
-        advance_deadline(&next);
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+        frame_timer_wait(&timer);
     }
 
     stop_halal_ocean_ambience();
-    restore_input();
+    restore_terminal_input();
 
     const char *exit_seq = "\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l\r\n";
-    write_all(STDOUT_FILENO, exit_seq, strlen(exit_seq));
+    write_all(exit_seq, strlen(exit_seq));
 
+    restore_terminal_output();
     free_buffers();
     return exit_code;
 }
