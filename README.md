@@ -1,4 +1,4 @@
-# 🐠 c-reef
+# c-reef
 
 [![CI](https://github.com/tahaenasraoui-debug/c-reef/actions/workflows/ci.yml/badge.svg)](https://github.com/tahaenasraoui-debug/c-reef/actions/workflows/ci.yml)
 ![Language](https://img.shields.io/badge/Language-C99-00599C?style=flat-square&logo=c&logoColor=white)
@@ -11,7 +11,7 @@
 
 ---
 
-## ✨ Visual Preview
+## Visual Preview
 
 ```text
                                  /|
@@ -32,7 +32,7 @@
 
 ---
 
-## 🚀 Key Features
+## Key Features
 
 * **Zero External Dependencies:** Built strictly with standard C99, `<math.h>`, POSIX system calls (`ioctl`, `sigaction`, `clock_nanosleep`, `write`) on Linux, and native Win32 Console APIs (`ENABLE_VIRTUAL_TERMINAL_PROCESSING`, `SetConsoleOutputCP`, `GetConsoleScreenBufferInfo`, `QueryPerformanceCounter`) on Windows. No `ncurses` required.
 * **Zero-Flicker Alternate Screen Rendering:** Maintains separate 2D character and ANSI color matrices in memory. Renders inside the terminal's alternate screen buffer (`\x1b[?1049h`) with explicit per-row coordinate addressing (`\x1b[row;1H`) and single-pass writes—eliminating flicker and line-wrap scrolling.
@@ -42,7 +42,7 @@
 
 ---
 
-## 🐟 Marine Roster & Autonomous Behaviors
+## Marine Roster & Autonomous Behaviors
 
 | # | Species | Height | ANSI Color | Behavior & Zone |
 | :- | :--- | :---: | :--- | :--- |
@@ -61,7 +61,7 @@
 
 ---
 
-## 🪟 Windows Download / Releases
+## Windows Download / Releases
 
 Prebuilt static `c-reef.exe` binaries (x86_64) and `SHA256SUMS.txt` are available on the [**Latest GitHub Release**](https://github.com/tahaenasraoui-debug/c-reef/releases/latest).
 
@@ -74,7 +74,7 @@ Prebuilt static `c-reef.exe` binaries (x86_64) and `SHA256SUMS.txt` are availabl
 
 ---
 
-## 🛠️ Compilation & Usage
+## Compilation & Usage
 
 ### Prerequisites
 * **Linux / POSIX:** A UTF-8 terminal emulator, `gcc` (or `clang`), `make`, and optionally `alsa-utils` (`aplay`) for `--sound`.
@@ -113,6 +113,6 @@ Set `NO_COLOR=1` to disable all colors. The terminal must be at least 30x12; sma
 
 ---
 
-## 📄 License
+## License
 
 Distributed under the [MIT License](LICENSE).
